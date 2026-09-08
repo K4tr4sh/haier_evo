@@ -10,8 +10,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
     entities = []
     for device in haier_object.devices:
         entities.extend(device.create_entities_switch())
-    entities.append(HttpSwitch(haier_object))
-    entities.append(HttpSwitchPOST(haier_object))
+    entities.append(HttpSwitch(haier_object, config_entry.entry_id))
+    entities.append(HttpSwitchPOST(haier_object, config_entry.entry_id))
     async_add_entities(entities)
     haier_object.write_ha_state()
     return True
@@ -168,9 +168,12 @@ class HaierREFVacationSwitch(HaierSwitch):
 class HttpSwitch(SwitchEntity):
     _attr_icon = "mdi:toggle-switch"
 
-    def __init__(self, haier):
+    def __init__(self, haier, entry_id: str = ""):
         self._haier = weakref.proxy(haier)
-        self._attr_unique_id = f"{DOMAIN}_http_switch_get"
+        # unique_id включает entry_id, иначе при нескольких записях
+        # интеграции (или после reload) возникает конфликт
+        # "does not generate unique IDs"
+        self._attr_unique_id = f"{DOMAIN}_{entry_id}_http_switch_get"
         self._attr_name = "Haier Evo HTTP GET"
 
     @property
@@ -196,9 +199,9 @@ class HttpSwitch(SwitchEntity):
 
 class HttpSwitchPOST(HttpSwitch):
 
-    def __init__(self, haier):
-        super().__init__(haier)
-        self._attr_unique_id = f"{DOMAIN}_http_switch_post"
+    def __init__(self, haier, entry_id: str = ""):
+        super().__init__(haier, entry_id)
+        self._attr_unique_id = f"{DOMAIN}_{entry_id}_http_switch_post"
         self._attr_name = "Haier Evo HTTP POST"
 
     @property

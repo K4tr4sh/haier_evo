@@ -114,7 +114,7 @@ class AuthResponse(object):
 
     @property
     def access_token(self) -> str | None:
-        assert "accessToken" in self.token, f"Bad data: refreshToken not found"
+        assert "accessToken" in self.token, f"Bad data: accessToken not found"
         value = self.token["accessToken"]
         assert isinstance(value, str) and value, f"Bad token: {value!r}"
         return value
@@ -271,8 +271,16 @@ class Haier(object):
             kwargs.setdefault('timeout', C.API_TIMEOUT)
             headers = kwargs.setdefault('headers', {})
             headers.setdefault('User-Agent', "evo-mobile")
-            headers.setdefault('Platform', "android")
-            headers.setdefault('Accept', "*/*")
+            # Заголовки версии приложения обязательны: без них сервер
+            # возвращает "Авторизация недоступна. Обновите приложение."
+            headers.setdefault('Version', C.APP_VERSION)
+            headers.setdefault('VersionCode', C.APP_VERSION_CODE)
+            headers.setdefault('Platform', C.APP_PLATFORM)
+            headers.setdefault('Device-model', C.APP_DEVICE_MODEL)
+            headers.setdefault('Time-zone', C.APP_TIMEZONE)
+            headers.setdefault('GAID', C.APP_GAID)
+            headers.setdefault('Accept', "application/json")
+            headers.setdefault('Accept-Language', "en-US,en;q=0.9")
             resp = requests.request(method, url, **kwargs)
             # _LOGGER.debug(resp.text)
             # Handling 429 Too Many Requests with retry
@@ -300,18 +308,24 @@ class Haier(object):
             response = AuthResponse(self.make_request('POST', path, data={
                 'email': self.email,
                 'password': self.password
+            }, headers={
+                'Device-Id': self._device_id,
             }))
             # _LOGGER.info(f"Login status code: {response.status_code}")
             response.raise_for_error()
         except ManyRequestsError as e:
             self.auth_login_limits.add_period(C.LOGIN_LIMIT_429)
             raise e
-        except AuthInternalError as e:
-            _LOGGER.error(str(e))
-            self.auth_login_limits.add_period(C.LOGIN_LIMIT_500)
-            response = e.response
         except AuthUserError as e:
             self.disconnect_requested = True
+            raise e
+        except AuthInternalError as e:
+            # Сервер отклонил вход (например "Авторизация недоступна. Обновите
+            # приложение.") — пробрасываем наверх, а не возвращаем пустой
+            # ответ без токенов, иначе интеграция продолжит работу без токена
+            # и покажет только служебные HTTP-тумблеры
+            _LOGGER.error(str(e))
+            self.auth_login_limits.add_period(C.LOGIN_LIMIT_500)
             raise e
         else:
             self.auth_login_limits.set_period()
@@ -327,6 +341,8 @@ class Haier(object):
             _LOGGER.debug(f"Refreshing token in to {path}")
             response = AuthResponse(self.make_request('POST', path, data={
                 'refreshToken': self.refreshtoken
+            }, headers={
+                'Device-Id': self._device_id,
             }))
             # _LOGGER.info(f"Refresh status code: {response.status_code}")
             response.raise_for_error()
@@ -367,14 +383,22 @@ class Haier(object):
         except AuthValidationError as e:
             raise e
         except AssertionError as e:
+            # Раньше ошибка молча глоталась и интеграция продолжала работу
+            # без токенов: в итоге devices=[] и в HA появлялись только
+            # служебные HTTP-тумблеры. Теперь setup падает с понятной ошибкой
             _LOGGER.error(f"Assertion error: {e}")
+            raise InvalidAuth() from e
+        except InvalidAuth:
+            raise
+        except AuthUserError as e:
+            raise InvalidAuth() from e
         except Exception as e:
             _LOGGER.error(
                 f"Failed to login/refresh token, "
                 f"response was: {resp}, "
                 f"err: {e}"
             )
-            raise InvalidAuth()
+            raise InvalidAuth() from e
         else:
             _LOGGER.debug(f"Successful update tokens")
 
@@ -397,24 +421,33 @@ class Haier(object):
     def pull_data_from_api(self) -> dict:
         self.auth()
         response = None
-        try:
-            devices_path = urljoin(C.API_PATH, C.API_DEVICES.format(region=self.region))
-            _LOGGER.debug(f"Getting devices, url: {devices_path}")
-            response = requests.get(devices_path, headers={
-                'X-Auth-Token': self.token,
-                'User-Agent': 'evo-mobile',
-                'Platform': 'android',
-                'Device-Id': self._device_id,
-                'Content-Type': 'application/json'
-            }, timeout=C.API_TIMEOUT)
-            # _LOGGER.debug(response.text)
-            response.raise_for_status()
-            data = response.json().get("data", {})
-            assert isinstance(data, dict), f"Data is not dict: {data}"
-            return data
-        except Exception as e:
-            _LOGGER.error(f"Failed to get devices {e}, response was: {response}")
-            return {}
+        # Новый формат страницы (spaces/house, как в мобильном приложении)
+        # пробуем первым, старый — как fallback
+        for path_template in (C.API_DEVICES_SPACES, C.API_DEVICES):
+            devices_path = urljoin(C.API_PATH, path_template.format(region=self.region))
+            try:
+                _LOGGER.debug(f"Getting devices, url: {devices_path}")
+                response = self.make_request('GET', devices_path, headers={
+                    'X-Auth-Token': self.token,
+                    'User-Agent': 'evo-mobile',
+                    'Version': C.APP_VERSION,
+                    'VersionCode': C.APP_VERSION_CODE,
+                    'Platform': C.APP_PLATFORM,
+                    'Device-model': C.APP_DEVICE_MODEL,
+                    'Time-zone': C.APP_TIMEZONE,
+                    'GAID': C.APP_GAID,
+                    'Device-Id': self._device_id,
+                    'Content-Type': 'application/json'
+                })
+                response.raise_for_status()
+                data = response.json().get("data", {})
+                assert isinstance(data, dict), f"Data is not dict: {data}"
+                return data
+            except Exception as e:
+                _LOGGER.error(f"Failed to get devices from {devices_path}: {e}")
+                response = None
+                continue
+        return {}
 
     @retry(
         retry=retry_if_exception_type(HTTPError),
@@ -426,13 +459,18 @@ class Haier(object):
         try:
             status_url = C.API_STATUS.format(mac=device_mac)
             _LOGGER.debug(f"Getting initial status of device {device_mac}, url: {status_url}")
-            response = requests.get(status_url, headers={
+            response = self.make_request('GET', status_url, headers={
                 'X-Auth-Token': self.token,
                 'User-Agent': 'evo-mobile',
-                'Platform': 'android',
+                'Version': C.APP_VERSION,
+                'VersionCode': C.APP_VERSION_CODE,
+                'Platform': C.APP_PLATFORM,
+                'Device-model': C.APP_DEVICE_MODEL,
+                'Time-zone': C.APP_TIMEZONE,
+                'GAID': C.APP_GAID,
                 'Device-Id': self._device_id,
                 'Content-Type': 'application/json'
-            }, timeout=C.API_TIMEOUT)
+            })
             # _LOGGER.debug(f"Update device {device_mac} status code: {response.status_code}")
             # _LOGGER.debug(response.text)s
             response.raise_for_status()
@@ -443,52 +481,143 @@ class Haier(object):
             raise
 
     def pull_data(self) -> None:
+        self.devices.clear()
         self._pull_data = data = self.pull_data_from_api()
         if not self._pull_data:
             raise InvalidDevicesList()
-        need_container_id = "72a6d224-cb66-4e6d-b427-2e4609252684"
-        presentation = data.setdefault("presentation", {})
-        layout = presentation.setdefault("layout", {})
-        containers = layout.setdefault("scrollContainer", [])
-        for item in containers[:]:
-            tracking_data = item.setdefault("trackingData", {})
-            component = tracking_data.setdefault("component", {})
-            component_id = component.setdefault("componentId", "")
-            # _LOGGER.debug(component_id)
-            component_name = component.setdefault("componentName", "")
-            if not (
-                component_name == "deviceList"
-                and component_id == need_container_id
-            ):
-                containers.remove(item)
-                continue
-            state_data = item.setdefault("state", "{}")
-            state_json = item['state'] = (
+        # Новый формат: компонент smartHomeSpacesV1, устройства разложены
+        # по комнатам (rooms.rooms[].items[]), link без параметров
+        # type/deviceId, mac хранится в поле macAddress
+        found = self._parse_devices_new_format(data)
+        if not found:
+            # Старый формат: deviceList с фиксированным componentId
+            found = self._parse_devices_legacy_format(data)
+        if found:
+            self.connect_in_thread()
+        else:
+            # Раньше пустой список устройств не считался ошибкой: интеграция
+            # «успешно» ставилась и в HA оставались только служебные
+            # HTTP-тумблеры без самих устройств
+            raise InvalidDevicesList()
+
+    def _add_device(self, device_type: str, device_mac: str, device_serial: str, device_title: str) -> None:
+        device_mac = (device_mac or "").replace('%3A', ':')
+        if not device_mac:
+            _LOGGER.warning(f"Skip device without mac: {device_title!r}")
+            return
+        try:
+            device = HaierDevice.create(
+                haier=self,
+                device_type=device_type,
+                device_mac=device_mac,
+                device_serial=device_serial,
+                device_title=device_title,
+            )
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.warning(f"Failed to create device {device_mac}: {e}")
+            return
+        self.devices.append(device)
+        _LOGGER.info(f"Added device: {device}")
+
+    @staticmethod
+    def _parse_component_state(item: dict) -> dict | None:
+        state_data = item.get("state", "{}")
+        try:
+            return (
                 json.loads(state_data)
                 if isinstance(state_data, str)
                 else state_data
             )
-            devices = state_json.setdefault("items", [])
-            for d in devices:
+        except ValueError:
+            return None
+
+    def _parse_devices_new_format(self, data: dict) -> bool:
+        """Новый формат SDUI: smartHomeSpacesV1 -> rooms.rooms[].items[]."""
+        presentation = data.get("presentation") or {}
+        layout = presentation.get("layout") or {}
+        containers = layout.get("scrollContainer") or []
+        found = False
+        for item in containers:
+            if not isinstance(item, dict):
+                continue
+            component = item.get("component")
+            if component != "smartHomeSpacesV1":
+                continue
+            state_json = self._parse_component_state(item)
+            if not isinstance(state_json, dict):
+                continue
+            rooms = (state_json.get("rooms") or {}).get("rooms") or []
+            for room in rooms:
+                for d in (room or {}).get("items") or []:
+                    if not isinstance(d, dict):
+                        continue
+                    # mac напрямую в поле macAddress (или через legacy link)
+                    device_mac = str(d.get("macAddress") or "")
+                    device_serial = str(d.get("serialNumber") or "")
+                    device_title = str(d.get("name") or "")
+                    device_type = self._device_type_from_item(d)
+                    if not device_mac:
+                        link = (d.get("action") or {}).get("link", "")
+                        parsed_link = urlparse(link)
+                        query_params = parse_qs(parsed_link.query)
+                        device_mac = query_params.get("deviceId", query_params.get("macAddress", [""]))[0]
+                        device_serial = query_params.get("serialNum", [""])[0] if not device_serial else device_serial
+                    self._add_device(device_type, device_mac, device_serial, device_title)
+                    found = True
+        return found
+
+    @staticmethod
+    def _device_type_from_item(d: dict) -> str:
+        """Определяем тип устройства: из action.link (type=...) либо по имени."""
+        link = str((d.get("action") or {}).get("link", ""))
+        if "type=Air+Conditioner" in link or "type=AC" in link:
+            return "AC"
+        if "type=Refrigerator" in link:
+            return "REF"
+        if "type=Washer" in link:
+            return "WM"
+        if d.get("deviceType"):
+            return str(d["deviceType"])
+        name = str(d.get("name") or "").lower()
+        if "холодильник" in name or "refrigerator" in name or "fridge" in name:
+            return "REF"
+        if "кондиционер" in name or "conditioner" in name:
+            return "AC"
+        # по умолчанию — AC, как в рабочем homebridge-плагине
+        return "AC"
+
+    def _parse_devices_legacy_format(self, data: dict) -> bool:
+        """Старый формат SDUI: deviceList с фиксированным componentId."""
+        need_container_id = "72a6d224-cb66-4e6d-b427-2e4609252684"
+        presentation = data.get("presentation") or {}
+        layout = presentation.get("layout") or {}
+        containers = layout.get("scrollContainer") or []
+        found = False
+        for item in containers:
+            if not isinstance(item, dict):
+                continue
+            tracking_data = item.get("trackingData") or {}
+            component = tracking_data.get("component") or {}
+            component_id = component.get("componentId", "")
+            component_name = component.get("componentName", "")
+            if not (component_name == "deviceList" and component_id == need_container_id):
+                continue
+            state_json = self._parse_component_state(item)
+            if not isinstance(state_json, dict):
+                continue
+            for d in state_json.get("items") or []:
+                if not isinstance(d, dict):
+                    continue
                 device_title = d.get('title', '')
-                device_link = d.get('action', {}).get('link', '')
+                device_link = (d.get('action') or {}).get('link', '')
                 parsed_link = urlparse(device_link)
                 query_params = parse_qs(parsed_link.query)
-                device_type = query_params.setdefault('type', ['UNKNOWN'])[0]
+                device_type = query_params.get('type', ['UNKNOWN'])[0]
                 device_mac = query_params.get('deviceId', [''])[0]
-                device_mac = device_mac.replace('%3A', ':')
                 device_serial = query_params.get('serialNum', [''])[0]
-                device = HaierDevice.create(
-                    haier=self,
-                    device_type=device_type,
-                    device_mac=device_mac,
-                    device_serial=device_serial,
-                    device_title=device_title,
-                )
-                self.devices.append(device)
-                _LOGGER.info(f"Added device: {device}")
-        if len(self.devices) > 0:
-            self.connect_in_thread()
+                self._add_device(device_type, device_mac, device_serial, device_title)
+                found = True
+        return found
 
     def get_device_by_id(self, id_: str) -> HaierDevice | None:
         return next(filter(
