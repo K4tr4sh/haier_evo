@@ -24,9 +24,12 @@ API_STATUS = "https://iot-platform.evo.haieronline.ru/mobile-backend-service/api
 API_WS_PATH = "wss://iot-platform.evo.haieronline.ru/gateway-ws-service/ws/"
 # Заголовки, имитирующие актуальную версию мобильного приложения.
 # Без них сервер отвечает "Авторизация недоступна. Обновите приложение."
-# (значения из рабочего плагина homebridge-haier-evo)
-APP_VERSION = "4.35.0"
-APP_VERSION_CODE = "13766"
+# Актуальная версия приложения "evo: умный дом от Haier" — 4.53.0.
+# ВАЖНО: by/kz-бэкенд пропускает только актуальную версию (проверено:
+# VersionCode 14500-15000 проходит гейт, 13766/14200/15500+ — нет),
+# ru-бэкенд лояльнее, но с 4.53.0 работает на всех регионах.
+APP_VERSION = "4.53.0"
+APP_VERSION_CODE = "15000"
 APP_PLATFORM = "ios"
 APP_DEVICE_MODEL = "iPhone17,1"
 APP_TIMEZONE = "Europe/Moscow"
